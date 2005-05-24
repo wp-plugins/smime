@@ -117,7 +117,6 @@ function smime_send($user, $subject, $message, $headers)
 		if(($id == null) && $options['send_on_missing']) {
 			// there's no user with this e-mail
 			array_push($plain_rcpt, $rcpt);
-			mail("elwing@elwing.org","www@elwing.org","plain_rcpt added: $rcpt",'');
 			continue;
 		}
 		$key = $wpdb->get_var("SELECT smime FROM ".$table_prefix."smime_users WHERE user_id=".$id.";");
@@ -126,7 +125,6 @@ function smime_send($user, $subject, $message, $headers)
 		{
 			// There's no key, but we want to send things anyway:
 			array_push($plain_rcpt, $rcpt);
-			mail("elwing@elwing.org","www@elwing.org","plain_rcpt added: $rcpt",'');
 			continue;
 		}
 
