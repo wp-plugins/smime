@@ -3,12 +3,12 @@
 Plugin Name: S/MIME Enabled e-mail
 Plugin URI: http://weblog.elwing.org/elwing
 Description: Allows Wordpress to send S/MIME encrypted and signed e-mails.
-Version: 0.01
-Author: Laura Bowser
+Version: 0.03
+Author: Elwing
 Author URI: http://weblog.elwing.org/elwing
 */
 
-/*  Copyright 2004  PLUGIN_AUTHOR_NAME  (email : PLUGIN AUTHOR EMAIL)
+/*  Copyright 2005 Elwing  (email : elwing@elwing.org)
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -25,6 +25,15 @@ Author URI: http://weblog.elwing.org/elwing
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
+/* The wp-mail implementation for 1.5.1: */
+/* TODO: Other plugins implementing wp_mail can override this! */
+if ( !function_exists('wp_mail') ) :
+function wp_mail($user,$subject, $message, $headers='') {
+	// Only calls the smimemailer
+	@smimemailer($user,$subject, $message, $headers);
+}
+endif;
+
 function smimemailer($user, $subject, $message, $headers='', $htmlmessage='') {
 	$options = get_option('smime_mailer');
 	if (! $options['use_smime'] && ! $options['use_pgp'] )
@@ -33,11 +42,11 @@ function smimemailer($user, $subject, $message, $headers='', $htmlmessage='') {
 	// We're going to use S/MIME mailing
 	if ( $options['use_smime'] )
 	{
-		smime_send($user, $subject, $message, $headers);
+		return @smime_send($user, $subject, $message, $headers);
 	}
 	elseif ($options['use_pgp'] )
 	{
-		smime_pgp_send($user, $subject, $message, $headers);
+		return @smime_pgp_send($user, $subject, $message, $headers);
 	}
 
 } //end smimemailer
@@ -55,25 +64,95 @@ function smime_send($user, $subject, $message, $headers)
 	//Let's get the options
 	$options = get_option('smime_mailer');
 
+	// Let's get all the headers
+	$tmp = explode("\r\n",$headers);
+
+	$ext_headers = "";
+		
+	$to_rcpt = array();
+	$cc_rcpt = array();
+	$bcc_rcpt = array();
+	$from = get_option('admin_email');
+
+	foreach ($tmp as $hdr) {
+		list($name, $value) = explode(": ", $hdr); 
+		switch (strtolower($name)) {
+			case "":
+				// Sometimes has a blank header value (\r\n at the end)
+				break;
+			case "to":
+				array_push($to_rcpt, $value);
+				break;
+			case "cc":
+				array_push($cc_rcpt, $value);
+				break;
+			case "bcc":
+				array_push($bcc_rcpt, $value);
+				break;
+			case "from":
+				$from = $value;
+			default:
+				$ext_headers .= "$name: $value\r\n";
+				break;
+		}
+	}
+
+	//Make sure we have all the recipients from $user: (with no spaces)
+	$user_rcpts = preg_split("/,(\s)*/",$user);
+
+	// We have all the recipients, let's find out which ones are encrypted and which aren't
+	$rcpts = array_merge($to_rcpt, $cc_rcpt, $bcc_rcpt, $user_rcpts);
+
+
 	//We want to verify that the $user has a key
 	global $wpdb, $table_prefix;
 
-	$id = $wpdb->get_var("SELECT id FROM ".$wpdb->users." WHERE user_email = '".$user."';");
-	$key = $wpdb->get_var("SELECT smime FROM ".$table_prefix."smime_users WHERE user_id=".$id.";");
+	$enc_rcpt = array();
+	$plain_rcpt = array();
 
-	echo "key: $key";
+	// For each recipient, see if they have a key:
+	foreach ($rcpts as $rcpt) {
 
-		$rows = $wpdb->num_rows;
-	if (($rows == 0) && $options['send_on_missing'])
-	{
-		// There's no key, but it's OK to send without encrypting
-		echo "no key, but send_on_missing enabled";
-		echo "user: $user, subject: $subject, headers: $headers, Message: $message";
-		@mail($user, $subject, $message, $headers);
+		$id = $wpdb->get_var("SELECT id FROM ".$wpdb->users." WHERE user_email = '".$rcpt."';");
+		if(($id == null) && $options['send_on_missing']) {
+			// there's no user with this e-mail
+			array_push($plain_rcpt, $rcpt);
+			mail("elwing@elwing.org","www@elwing.org","plain_rcpt added: $rcpt",'');
+			continue;
+		}
+		$key = $wpdb->get_var("SELECT smime FROM ".$table_prefix."smime_users WHERE user_id=".$id.";");
+
+		if (($key == null) && $options['send_on_missing'])
+		{
+			// There's no key, but we want to send things anyway:
+			array_push($plain_rcpt, $rcpt);
+			mail("elwing@elwing.org","www@elwing.org","plain_rcpt added: $rcpt",'');
+			continue;
+		}
+
+		if($key != null)	{
+			// We have a key
+
+			array_push($enc_rcpt, array($rcpt, $key));
+		}
 	}
 
-	if($rows == 1)	{
-		// We have a key, let's send it!
+	// If there are unencrypted e-mails to send:
+	if ((count($plain_rcpt) > 0) && $options['send_on_missing'])
+	{
+
+		$to = implode(",", array_intersect($plain_rcpt, $user_rcpts));
+		$headers = smime_create_rcpt_hdrs("Cc", array_intersect($plain_rcpt, $cc_rcpt));
+		$headers .= smime_create_rcpt_hdrs("Bcc", array_intersect($plain_rcpt, $bcc_rcpt));
+		$headers .= $ext_headers;
+
+		mail($to, $subject, $message, $headers);
+	}
+
+	if(count($enc_rcpt) > 0) {
+
+		// We have 	encrypted mails to send
+		// Unfortunately, openssl_pkcs7 cannot encrypt for multiple recipients
 
 		//openssl pkcs7 functions must read and write to files :(
 		$clearfile = tempnam("temp","email");
@@ -84,23 +163,23 @@ function smime_send($user, $subject, $message, $headers)
 		fwrite($fp,$message);
 		fclose($fp);
 
-		//Do the encryption
-		if (openssl_pkcs7_encrypt($clearfile,$encfile,$key,
-			array("To" => $user,
-					"From" => $from,
-					"Subject" => $subject)))
-		{
-			$data = file_get_contents($encfile);
+		// This is horribly inefficient and should be fixed (somehow)
 
-			//separate header and body, to use with mail function
-			$parts = explode("\r\n",$data, 2);
+		foreach ($enc_rcpt as $rcpt) {
 
-			$newheaders = $header . $parts[0];
 
-			// Send the mail!
-			echo "Sending encrypted mail";
-			echo "Parts1: $parts[1], headers: $newheaders";
-			@mail("","",$parts[1],$newheaders);
+			//Do the encryption
+			if (openssl_pkcs7_encrypt($clearfile,$encfile,$rcpt[1],
+				array("To" => $rcpt[0], "From" => $from, "Subject" => $subject)))
+			{
+				$data = file_get_contents($encfile);
+	
+				//separate header and body, to use with mail function
+				$parts = explode("\n\n",$data, 2);
+	
+				// Send the mail!
+				mail($rcpt[0],$subject,$parts[1],$parts[0]);
+			}
 		}
 
 		//Unlink the temporary files:
@@ -108,6 +187,27 @@ function smime_send($user, $subject, $message, $headers)
 		unlink($encfile);
 	}
 
+}
+
+/*********************************
+ * smime_create_rcpt_hdrs($hdr, $rcpts)
+ *  creates a text string for the headers
+ *
+ * Called by: smime_send()
+ *
+ *********************************/
+function smime_create_rcpt_hdrs($hdr, $rcpts) {
+
+	$ret = "";
+
+	if(count($rcpts) < 1)
+		return $ret;
+
+	foreach($rcpts as $rcpt) {
+		$ret .= "$hdr: $rcpt\r\n";
+	}
+
+	return $ret;
 }
 
 
@@ -141,7 +241,7 @@ function smime_create_table() {
 
 function smime_add_pages() {
 	//Add menu under options:
-	add_options_page('Crypto Options', 'Crypto Options', 9, __FILE__,'smime_admin_page');
+	add_options_page('Encryption', 'Encryption', 9, __FILE__,'smime_admin_page');
 	//Add menu under users:
 	add_submenu_page('profile.php', 'Encryption Keys', 'Encryption Keys', 1, __FILE__,'smime_user_page');
 	//Create option in options database if not there already:
@@ -186,6 +286,11 @@ function smime_admin_page()
 				$options['use_pgp'] = 1;
 			}
 		}
+		if(isset($_POST['use_smime']))
+			$options['use_smime'] = 1;
+		else
+			$options['use_smime'] = 0;
+
 		if (isset($_POST['send_on_missing']) )
 			$options['send_on_missing'] = 1;
 		else
@@ -227,7 +332,7 @@ function smime_admin_page()
 		{
 			if (isset($_POST['always_sign'])) 
 			{
-				$error .= 'In order to use Always Sign, you must provide a private key';
+				$error .= 'In order to use "Sign all outgoing messages", you must provide a private key';
 				$success = FALSE;
 			}
 			$options['blog_privatekey'] = '';
@@ -272,7 +377,7 @@ function smime_admin_page()
 
 	$action_url = $_SERVER[PHP_SELF] . '?page=' .basename(__FILE__);
 
-	if( $options['use_smime']  == 0) {
+/*	if( $options['use_smime']  == 0) {
 		$use_none = 'checked';
 		$use_smime = '';
 		$use_pgp = '';
@@ -285,45 +390,34 @@ function smime_admin_page()
 		$use_smime = '';
 		$use_pgp = 'checked';
 	}
+*/
 
+	$use_smime = $options['use_smime'] ? ' checked="checked"' : '';
 	$send_on_missing = $options['send_on_missing'] ? ' checked="checked"' : '';
 	$always_sign = $options['always_sign'] ? ' checked="checked"' : '';
 ?>
 	<div class='wrap'>
-	<h2>S/MIME Plugin Options</h2>
+	<h2>S/MIME Options</h2>
 	<p>S/MIME is a plugin that enables Wordpress to use S/MIME encrypted e-mails for notifications</p>
-
-	<p><strong>Note:</strong> This plugin requires a single change to a core Wordpress file.</p>
-
-	<p>The hack:
-	<ol>
-	<li>Edit the file <code>wp-includes/functions.php</code></li>
-	<li>Search for the <code>wp_mail()</code> function: <br />
-
-	<code>function wp_mail($to, $subject, $message, $headers = '') {</code></li>
-    <li>At the end of that function, change <code>@mail(</code> to <code>@smimemailer(</code></li>
-        </ol>
-	   
-	<hr />
 
 	<form name="smimemailer" action="<?php echo $action_url; ?>" method="post">
         <input type="hidden" name="submitted" value="1" />
 
-		  <h3>Type of Encryption to Use</h3>
+<!--		  <h3>Encryption Type</h3>
 
 		  <input type="radio" name="enc_type" value="0" <?php echo $use_none ?>> No Encryption <br />
 		  <input type="radio" name="enc_type" value="1" <?php echo $use_smime ?>> S/MIME Encryption <br />
-		 <!--
 		  <input type="radio" name="enc_type" value="2" <?php echo $use_pgp ?>> PGP Encryption <br />
 -->
-		  <h3>Options</h3>
-		  <p><input type="checkbox" name="send_on_missing" <?php echo $send_on_missing ?>> Send unencrypted when no recipient certificate is available </p>
-<!--		  <p><input type="checkbox" name="always_sign" <?php echo $always_sign ?>> Always sign outgoing mail? (Requires Blog private key)
--->
+	<fieldset class="options"><legend>Options</legend>
+			<p><input type="checkbox" name="use_smime" <?php echo $use_smime ?>> Encrypt all outgoing messages</p>
+		  <p>&nbsp;&nbsp;<input type="checkbox" name="send_on_missing" <?php echo $send_on_missing ?>> Send unencrypted when certificate is unavailable </p>
+		  <p><input type="checkbox" name="always_sign" <?php echo $always_sign ?>> Sign all outgoing messages (Requires Blog private key)
+</fieldset>
 
-		  <h3>Certificates and Keys</h3>
-		  <p>Here, you can set the public and private keys belonging to the weblog.</p>
-		  <p><strong>Caution:</strong> The private key will be stored in the database, ensure that you have appropriate protections in place.  You must provide a private key in order to enable the "Always Sign" option.</p>
+	<fieldset class="options"> <legend>Certificate and Key</legend>
+		  <p>This is the public certificate and private key belonging to the weblog.</p>
+		  <p><strong>Caution:</strong> The private key will be stored in the database, ensure that you have appropriate protections in place.  You must provide a private key in order to enable the "Sign all outgoing messages" option.</p>
 
 			<p>S/MIME Public Certificate in PEM format</p>
 <!--		 	<p><input type="file" name="smimepublicfile" size="40"></p> 
@@ -344,7 +438,7 @@ function smime_admin_page()
 			<textarea name="pgpprivatekey" cols="40" rows="6"></textarea>
 		 
 		 -->
-
+</fieldset>
 
 	<div class="submit"><input type="submit" name="Submit" value="Save changes &raquo;" /></div>
 	</form>
